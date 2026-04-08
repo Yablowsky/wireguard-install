@@ -102,13 +102,13 @@ function getHomeDirForClient() {
 		# if not, use SUDO_USER
 		if [ "${SUDO_USER}" == "root" ]; then
 			# If running sudo as root
-			HOME_DIR="/root"
+			HOME_DIR="/root/opt/wg/clients"
 		else
 			HOME_DIR="/home/${SUDO_USER}"
 		fi
 	else
 		# if not SUDO_USER, use /root
-		HOME_DIR="/root"
+		HOME_DIR="/root/opt/wg/clients"
 	fi
 
 	echo "$HOME_DIR"
