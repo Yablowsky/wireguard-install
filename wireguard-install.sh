@@ -86,6 +86,14 @@ function checkOS() {
 	fi
 }
 
+function getClientDirForInterface() {
+	local IFACE="$1"
+	local DIR="/opt/wireguard/${IFACE}-clients"
+	mkdir -p "${DIR}"
+	chmod 700 "${DIR}"
+	echo "${DIR}"
+}
+
 function getHomeDirForClient() {
 	local CLIENT_NAME=$1
 
@@ -118,6 +126,73 @@ function initialCheck() {
 	isRoot
 	checkOS
 	checkVirt
+}
+
+function listInterfaces() {
+	find /etc/wireguard -maxdepth 1 -type f -name "*.conf" | sed 's#.*/##' | sed 's/\.conf$//' | sort
+}
+
+function interfaceExists() {
+	local IFACE="$1"
+	[[ -f "/etc/wireguard/${IFACE}.conf" ]]
+}
+
+function loadInterfaceParams() {
+	local IFACE="$1"
+
+	if ! [[ -f "/etc/wireguard/${IFACE}.params" ]]; then
+		echo -e "${RED}Params file for interface ${IFACE} not found: /etc/wireguard/${IFACE}.params${NC}"
+		exit 1
+	fi
+
+	# shellcheck disable=SC1090
+	source "/etc/wireguard/${IFACE}.params"
+}
+
+function selectInterface() {
+	mapfile -t IFACES < <(listInterfaces)
+
+	if [[ ${#IFACES[@]} -eq 0 ]]; then
+		echo "No WireGuard interfaces found."
+		exit 1
+	fi
+
+	echo ""
+	echo "Available interfaces:"
+	for i in "${!IFACES[@]}"; do
+		echo "  $((i+1))) ${IFACES[$i]}"
+	done
+
+	local CHOICE
+	until [[ ${CHOICE} =~ ^[0-9]+$ ]] && (( CHOICE >= 1 && CHOICE <= ${#IFACES[@]} )); do
+		read -rp "Select interface [1-${#IFACES[@]}]: " CHOICE
+	done
+
+	SERVER_WG_NIC="${IFACES[$((CHOICE-1))]}"
+	loadInterfaceParams "${SERVER_WG_NIC}"
+}
+
+function removeInterface() {
+	selectInterface
+
+	echo ""
+	echo -e "${RED}WARNING: This will remove interface ${SERVER_WG_NIC} and its clients only.${NC}"
+	read -rp "Do you really want to remove ${SERVER_WG_NIC}? [y/n]: " -e REMOVE_ONE
+	REMOVE_ONE=${REMOVE_ONE:-n}
+
+	if [[ ${REMOVE_ONE} != "y" ]]; then
+		echo "Removal aborted!"
+		return
+	fi
+
+	systemctl stop "wg-quick@${SERVER_WG_NIC}" 2>/dev/null || true
+	systemctl disable "wg-quick@${SERVER_WG_NIC}" 2>/dev/null || true
+
+	rm -f "/etc/wireguard/${SERVER_WG_NIC}.conf"
+	rm -f "/etc/wireguard/${SERVER_WG_NIC}.params"
+	rm -rf "/opt/wireguard/${SERVER_WG_NIC}-clients"
+
+	echo -e "${GREEN}Interface ${SERVER_WG_NIC} removed.${NC}"
 }
 
 function installQuestions() {
@@ -254,7 +329,7 @@ SERVER_PRIV_KEY=${SERVER_PRIV_KEY}
 SERVER_PUB_KEY=${SERVER_PUB_KEY}
 CLIENT_DNS_1=${CLIENT_DNS_1}
 CLIENT_DNS_2=${CLIENT_DNS_2}
-ALLOWED_IPS=${ALLOWED_IPS}" >/etc/wireguard/params
+ALLOWED_IPS=${ALLOWED_IPS}" >/etc/wireguard/${SERVER_WG_NIC}.params
 
 	# Add server interface
 	echo "[Interface]
@@ -384,7 +459,7 @@ function newClient() {
 	CLIENT_PUB_KEY=$(echo "${CLIENT_PRIV_KEY}" | wg pubkey)
 	CLIENT_PRE_SHARED_KEY=$(wg genpsk)
 
-	HOME_DIR=$(getHomeDirForClient "${CLIENT_NAME}")
+	CLIENT_DIR=$(getClientDirForInterface "${SERVER_WG_NIC}")
 
 	# Create client file and add the server as a peer
 	echo "[Interface]
@@ -401,7 +476,7 @@ DNS = ${CLIENT_DNS_1},${CLIENT_DNS_2}
 PublicKey = ${SERVER_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 Endpoint = ${ENDPOINT}
-AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf"
+AllowedIPs = ${ALLOWED_IPS}" >"${CLIENT_DIR}/${CLIENT_NAME}.conf"
 
 	# Add the client as a peer to the server
 	echo -e "\n### Client ${CLIENT_NAME}
@@ -410,16 +485,18 @@ PublicKey = ${CLIENT_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 AllowedIPs = ${CLIENT_WG_IPV4}/32,${CLIENT_WG_IPV6}/128" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
 
+	if ip link show "${SERVER_WG_NIC}" >/dev/null 2>&1; then
 	wg syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${SERVER_WG_NIC}")
+	fi
 
 	# Generate QR code if qrencode is installed
 	if command -v qrencode &>/dev/null; then
 		echo -e "${GREEN}\nHere is your client config file as a QR Code:\n${NC}"
-		qrencode -t ansiutf8 -l L <"${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf"
+		qrencode -t ansiutf8 -l L <"${CLIENT_DIR}/${CLIENT_NAME}.conf"
 		echo ""
 	fi
 
-	echo -e "${GREEN}Your client config file is in ${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf${NC}"
+	echo -e "${GREEN}Your client config file is in ${CLIENT_DIR}/${CLIENT_NAME}.conf${NC}"
 }
 
 function listClients() {
@@ -459,11 +536,13 @@ function revokeClient() {
 	sed -i "/^### Client ${CLIENT_NAME}\$/,/^$/d" "/etc/wireguard/${SERVER_WG_NIC}.conf"
 
 	# remove generated client file
-	HOME_DIR=$(getHomeDirForClient "${CLIENT_NAME}")
-	rm -f "${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf"
+	CLIENT_DIR=$(getClientDirForInterface "${SERVER_WG_NIC}")
+	rm -f "${CLIENT_DIR}/${CLIENT_NAME}.conf"
 
 	# restart wireguard to apply changes
+	if ip link show "${SERVER_WG_NIC}" >/dev/null 2>&1; then
 	wg syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${SERVER_WG_NIC}")
+	fi
 }
 
 function uninstallWg() {
@@ -537,33 +616,48 @@ function uninstallWg() {
 
 function manageMenu() {
 	echo "Welcome to WireGuard-install!"
-	echo "The git repository is available at: https://github.com/angristan/wireguard-install"
-	echo ""
-	echo "It looks like WireGuard is already installed."
 	echo ""
 	echo "What do you want to do?"
-	echo "   1) Add a new user"
-	echo "   2) List all users"
-	echo "   3) Revoke existing user"
-	echo "   4) Uninstall WireGuard"
-	echo "   5) Exit"
-	until [[ ${MENU_OPTION} =~ ^[1-5]$ ]]; do
-		read -rp "Select an option [1-5]: " MENU_OPTION
+	echo "   1) Create new interface"
+	echo "   2) List interfaces"
+	echo "   3) Add new client to interface"
+	echo "   4) List clients of interface"
+	echo "   5) Revoke client from interface"
+	echo "   6) Remove interface"
+	echo "   7) Uninstall WireGuard completely"
+	echo "   8) Exit"
+
+	local MENU_OPTION
+	until [[ ${MENU_OPTION} =~ ^[1-8]$ ]]; do
+		read -rp "Select an option [1-8]: " MENU_OPTION
 	done
+
 	case "${MENU_OPTION}" in
 	1)
-		newClient
+		installWireGuard
 		;;
 	2)
-		listClients
+		listInterfaces
 		;;
 	3)
-		revokeClient
+		selectInterface
+		newClient
 		;;
 	4)
-		uninstallWg
+		selectInterface
+		listClients
 		;;
 	5)
+		selectInterface
+		revokeClient
+		;;
+	6)
+		removeInterface
+		;;
+	7)
+		uninstallWg
+		;;
+	8)
 		exit 0
 		;;
 	esac
@@ -573,8 +667,7 @@ function manageMenu() {
 initialCheck
 
 # Check if WireGuard is already installed and load params
-if [[ -e /etc/wireguard/params ]]; then
-	source /etc/wireguard/params
+if compgen -G "/etc/wireguard/*.conf" > /dev/null; then
 	manageMenu
 else
 	installWireGuard
