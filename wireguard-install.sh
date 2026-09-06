@@ -255,11 +255,12 @@ function installQuestions() {
 	until [[ ${CLIENT_DNS_1} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; do
 		read -rp "First DNS resolver to use for the clients: " -e -i 1.1.1.1 CLIENT_DNS_1
 	done
-	until [[ ${CLIENT_DNS_2} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; do
-		read -rp "Second DNS resolver to use for the clients (optional): " -e -i 1.0.0.1 CLIENT_DNS_2
-		if [[ ${CLIENT_DNS_2} == "" ]]; then
-			CLIENT_DNS_2="${CLIENT_DNS_1}"
+	while true; do
+		read -rp "Second DNS resolver to use for the clients (optional): " -e CLIENT_DNS_2
+		if [[ -z ${CLIENT_DNS_2} ]] || [[ ${CLIENT_DNS_2} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; then
+			break
 		fi
+		echo -e "${ORANGE}Please enter a valid IPv4 address or leave the field empty.${NC}"
 	done
 
 	until [[ ${ALLOWED_IPS} =~ ^.+$ ]]; do
@@ -271,16 +272,12 @@ function installQuestions() {
 	done
 
 	echo ""
-	echo "Okay, that was all I needed. We are ready to setup your WireGuard server now."
-	echo "You will be able to generate a client at the end of the installation."
+	echo "Okay, that was all I needed. We are ready to create the WireGuard interface now."
+	echo "You will be able to generate a client after the interface is started."
 	read -n1 -r -p "Press any key to continue..."
 }
 
-function installWireGuard() {
-	# Run setup questions first
-	installQuestions
-
-	# Install WireGuard tools and module
+function installWireGuardPackages() {
 	if [[ ${OS} == 'ubuntu' ]] || [[ ${OS} == 'debian' && ${VERSION_ID} -gt 10 ]]; then
 		apt-get update
 		installPackages apt-get install -y wireguard iptables resolvconf qrencode
@@ -319,17 +316,30 @@ function installWireGuard() {
 		installPackages apk add wireguard-tools iptables libqrencode-tools
 	fi
 
-	# Verify WireGuard installation
-	if ! command -v wg &>/dev/null; then
-		echo -e "${RED}WireGuard installation failed. The 'wg' command was not found.${NC}"
+	if ! command -v wg &>/dev/null || ! command -v wg-quick &>/dev/null; then
+		echo -e "${RED}WireGuard installation failed. Required commands were not found.${NC}"
 		echo "Please check the installation output above for errors."
 		exit 1
 	fi
+}
+
+function enableIpForwarding() {
+	echo "net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/wg.conf
+
+	sysctl -p /etc/sysctl.d/wg.conf
+
+	if [[ ${OS} == 'alpine' ]]; then
+		rc-update add sysctl
+	fi
+}
+
+function setupWireGuardInterface() {
+	local WG_RUNNING
 
 	# Make sure the directory exists (this does not seem the be the case on fedora)
-	mkdir /etc/wireguard >/dev/null 2>&1
-
-	chmod 600 -R /etc/wireguard/
+	mkdir -p /etc/wireguard
+	chmod 700 /etc/wireguard
 
 	SERVER_PRIV_KEY=$(wg genkey)
 	SERVER_PUB_KEY=$(echo "${SERVER_PRIV_KEY}" | wg pubkey)
@@ -353,26 +363,14 @@ Address = ${SERVER_WG_IPV4}/24,${SERVER_WG_IPV6}/64
 ListenPort = ${SERVER_PORT}
 PrivateKey = ${SERVER_PRIV_KEY}" >"/etc/wireguard/${SERVER_WG_NIC}.conf"
 
-	# Enable routing on the server
-	echo "net.ipv4.ip_forward = 1
-net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/wg.conf
-
-	if [[ ${OS} == 'fedora' ]]; then
-		chmod -v 700 /etc/wireguard
-		chmod -v 600 /etc/wireguard/*
-	fi
+	chmod 600 "/etc/wireguard/${SERVER_WG_NIC}.params" "/etc/wireguard/${SERVER_WG_NIC}.conf"
 
 	if [[ ${OS} == 'alpine' ]]; then
-		sysctl -p /etc/sysctl.d/wg.conf
-		rc-update add sysctl
 		ln -s /etc/init.d/wg-quick "/etc/init.d/wg-quick.${SERVER_WG_NIC}"
 		rc-service "wg-quick.${SERVER_WG_NIC}" start
 		rc-update add "wg-quick.${SERVER_WG_NIC}"
 	else
-		sysctl --system
-
-		systemctl start "wg-quick@${SERVER_WG_NIC}"
-		systemctl enable "wg-quick@${SERVER_WG_NIC}"
+		systemctl enable --now "wg-quick@${SERVER_WG_NIC}"
 	fi
 
 	# Check if WireGuard is running
@@ -403,6 +401,23 @@ net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/wg.conf
 	fi
 
 	addClients
+}
+
+function installWireGuard() {
+	installQuestions
+	installWireGuardPackages
+	enableIpForwarding
+	setupWireGuardInterface
+}
+
+function createWireGuardInterface() {
+	if ! command -v wg &>/dev/null || ! command -v wg-quick &>/dev/null; then
+		echo -e "${RED}WireGuard tools are not installed. Cannot create another interface.${NC}"
+		return 1
+	fi
+
+	installQuestions
+	setupWireGuardInterface
 }
 
 function generateClientQrCode() {
@@ -443,11 +458,13 @@ function newClient() {
 	local CLIENT_EXISTS=""
 	local DOT_IP
 	local DOT_EXISTS
-	local BASE_IP
+	local BASE_IPV4
+	local BASE_IPV6
 	local IPV4_EXISTS=""
 	local IPV6_EXISTS=""
 	local CLIENT_WG_IPV4
 	local CLIENT_WG_IPV6
+	local CLIENT_DNS
 	local CLIENT_PRIV_KEY
 	local CLIENT_PUB_KEY
 	local CLIENT_PRE_SHARED_KEY
@@ -461,6 +478,11 @@ function newClient() {
 		fi
 	fi
 	ENDPOINT="${ENDPOINT_IP}:${SERVER_PORT}"
+	if [[ -z ${CLIENT_DNS_2} ]] || [[ ${CLIENT_DNS_2} == "${CLIENT_DNS_1}" ]]; then
+		CLIENT_DNS="${CLIENT_DNS_1}"
+	else
+		CLIENT_DNS="${CLIENT_DNS_1},${CLIENT_DNS_2}"
+	fi
 
 	echo ""
 	echo "Client configuration"
@@ -478,9 +500,15 @@ function newClient() {
 		fi
 	done
 
-	BASE_IP=$(echo "$SERVER_WG_IPV4" | awk -F '.' '{ print $1"."$2"."$3 }')
+	BASE_IPV4=$(echo "$SERVER_WG_IPV4" | awk -F '.' '{ print $1"."$2"."$3 }')
+	BASE_IPV6=$(echo "$SERVER_WG_IPV6" | awk -F '::' '{ print $1 }')
 	for DOT_IP in {2..254}; do
-		DOT_EXISTS=$(grep -F -c "${BASE_IP}.${DOT_IP}/32" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+		if [[ "${BASE_IPV4}.${DOT_IP}" == "${SERVER_WG_IPV4}" ]] || [[ "${BASE_IPV6}::${DOT_IP}" == "${SERVER_WG_IPV6}" ]]; then
+			DOT_EXISTS=1
+			continue
+		fi
+
+		DOT_EXISTS=$(grep -F -c "${BASE_IPV4}.${DOT_IP}/32" "/etc/wireguard/${SERVER_WG_NIC}.conf")
 		if [[ ${DOT_EXISTS} == '0' ]]; then
 			break
 		fi
@@ -488,14 +516,26 @@ function newClient() {
 
 	if [[ ${DOT_EXISTS} == '1' ]]; then
 		echo ""
-		echo "The subnet configured supports only 253 clients."
+		echo "No free client addresses are available in the configured subnet."
 		return 1
 	fi
 
 	until [[ ${IPV4_EXISTS} == '0' ]]; do
-		read -rp "Client WireGuard IPv4: ${BASE_IP}." -e -i "${DOT_IP}" DOT_IP
-		CLIENT_WG_IPV4="${BASE_IP}.${DOT_IP}"
-		IPV4_EXISTS=$(grep -c "$CLIENT_WG_IPV4/32" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+		read -rp "Client WireGuard IPv4: ${BASE_IPV4}." -e -i "${DOT_IP}" DOT_IP
+		if ! [[ ${DOT_IP} =~ ^[0-9]+$ ]] || ((DOT_IP < 2 || DOT_IP > 254)); then
+			IPV4_EXISTS=1
+			echo -e "${ORANGE}The IPv4 host number must be between 2 and 254.${NC}"
+			continue
+		fi
+
+		CLIENT_WG_IPV4="${BASE_IPV4}.${DOT_IP}"
+		if [[ ${CLIENT_WG_IPV4} == "${SERVER_WG_IPV4}" ]]; then
+			IPV4_EXISTS=1
+			echo -e "${ORANGE}${CLIENT_WG_IPV4} is assigned to the server interface. Please choose another IPv4.${NC}"
+			continue
+		fi
+
+		IPV4_EXISTS=$(grep -F -c "${CLIENT_WG_IPV4}/32" "/etc/wireguard/${SERVER_WG_NIC}.conf")
 
 		if [[ ${IPV4_EXISTS} != 0 ]]; then
 			echo ""
@@ -504,11 +544,22 @@ function newClient() {
 		fi
 	done
 
-	BASE_IP=$(echo "$SERVER_WG_IPV6" | awk -F '::' '{ print $1 }')
 	until [[ ${IPV6_EXISTS} == '0' ]]; do
-		read -rp "Client WireGuard IPv6: ${BASE_IP}::" -e -i "${DOT_IP}" DOT_IP
-		CLIENT_WG_IPV6="${BASE_IP}::${DOT_IP}"
-		IPV6_EXISTS=$(grep -c "${CLIENT_WG_IPV6}/128" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+		read -rp "Client WireGuard IPv6: ${BASE_IPV6}::" -e -i "${DOT_IP}" DOT_IP
+		if ! [[ ${DOT_IP} =~ ^[0-9a-fA-F]{1,4}$ ]]; then
+			IPV6_EXISTS=1
+			echo -e "${ORANGE}The IPv6 host part must contain from 1 to 4 hexadecimal characters.${NC}"
+			continue
+		fi
+
+		CLIENT_WG_IPV6="${BASE_IPV6}::${DOT_IP}"
+		if [[ ${CLIENT_WG_IPV6,,} == "${SERVER_WG_IPV6,,}" ]]; then
+			IPV6_EXISTS=1
+			echo -e "${ORANGE}${CLIENT_WG_IPV6} is assigned to the server interface. Please choose another IPv6.${NC}"
+			continue
+		fi
+
+		IPV6_EXISTS=$(grep -F -c "${CLIENT_WG_IPV6}/128" "/etc/wireguard/${SERVER_WG_NIC}.conf")
 
 		if [[ ${IPV6_EXISTS} != 0 ]]; then
 			echo ""
@@ -529,7 +580,7 @@ function newClient() {
 	echo "[Interface]
 PrivateKey = ${CLIENT_PRIV_KEY}
 Address = ${CLIENT_WG_IPV4}/32,${CLIENT_WG_IPV6}/128
-DNS = ${CLIENT_DNS_1},${CLIENT_DNS_2}
+DNS = ${CLIENT_DNS}
 
 # Uncomment the next line to set a custom MTU
 # This might impact performance, so use it only if you know what you are doing
@@ -762,7 +813,7 @@ function manageMenu() {
 
 		case "${MENU_OPTION}" in
 		1)
-			installWireGuard
+			createWireGuardInterface
 			;;
 		2)
 			listInterfaces
