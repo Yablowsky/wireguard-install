@@ -40,6 +40,8 @@ It will install WireGuard (kernel module and tools) on the server, configure it,
 
 Run the script again to add or remove clients!
 
+Package installation and IP forwarding setup are performed only during the initial installation. Creating additional interfaces reuses the installed WireGuard tools without refreshing package indexes or reapplying all system settings.
+
 ## Client files
 
 Client files are stored separately for each WireGuard interface:
