@@ -40,6 +40,15 @@ It will install WireGuard (kernel module and tools) on the server, configure it,
 
 Run the script again to add or remove clients!
 
+## Client files
+
+Client files are stored separately for each WireGuard interface:
+
+- Configs: `/opt/wireguard/<interface>-clients/<client>.conf`
+- QR codes: `/opt/wireguard/<interface>-qrcodes/<client>.png`
+
+The management menu can also display the QR code for any existing client whose config file is still available. Client config and QR code files contain private key material and are created with permissions restricted to root.
+
 ## Providers
 
 I recommend these cheap cloud providers for your VPN server:

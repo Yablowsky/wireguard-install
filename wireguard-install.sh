@@ -94,32 +94,12 @@ function getClientDirForInterface() {
 	echo "${DIR}"
 }
 
-function getHomeDirForClient() {
-	local CLIENT_NAME=$1
-
-	if [ -z "${CLIENT_NAME}" ]; then
-		echo "Error: getHomeDirForClient() requires a client name as argument"
-		exit 1
-	fi
-
-	# Home directory of the user, where the client configuration will be written
-	if [ -e "/home/${CLIENT_NAME}" ]; then
-		# if $1 is a user name
-		HOME_DIR="/home/${CLIENT_NAME}"
-	elif [ "${SUDO_USER}" ]; then
-		# if not, use SUDO_USER
-		if [ "${SUDO_USER}" == "root" ]; then
-			# If running sudo as root
-			HOME_DIR="/root"
-		else
-			HOME_DIR="/home/${SUDO_USER}"
-		fi
-	else
-		# if not SUDO_USER, use /root
-		HOME_DIR="/root"
-	fi
-
-	echo "$HOME_DIR"
+function getQrDirForInterface() {
+	local IFACE="$1"
+	local DIR="/opt/wireguard/${IFACE}-qrcodes"
+	mkdir -p "${DIR}"
+	chmod 700 "${DIR}"
+	echo "${DIR}"
 }
 
 function initialCheck() {
@@ -142,38 +122,43 @@ function loadInterfaceParams() {
 
 	if ! [[ -f "/etc/wireguard/${IFACE}.params" ]]; then
 		echo -e "${RED}Params file for interface ${IFACE} not found: /etc/wireguard/${IFACE}.params${NC}"
-		exit 1
+		return 1
 	fi
 
 	# shellcheck disable=SC1090
-	source "/etc/wireguard/${IFACE}.params"
+	source "/etc/wireguard/${IFACE}.params" || return 1
 }
 
 function selectInterface() {
+	local -a IFACES
+	local CHOICE=""
+	local i
+
 	mapfile -t IFACES < <(listInterfaces)
 
 	if [[ ${#IFACES[@]} -eq 0 ]]; then
 		echo "No WireGuard interfaces found."
-		exit 1
+		return 1
 	fi
 
 	echo ""
 	echo "Available interfaces:"
 	for i in "${!IFACES[@]}"; do
-		echo "  $((i+1))) ${IFACES[$i]}"
+		echo "  $((i + 1))) ${IFACES[$i]}"
 	done
 
-	local CHOICE
-	until [[ ${CHOICE} =~ ^[0-9]+$ ]] && (( CHOICE >= 1 && CHOICE <= ${#IFACES[@]} )); do
+	until [[ ${CHOICE} =~ ^[0-9]+$ ]] && ((CHOICE >= 1 && CHOICE <= ${#IFACES[@]})); do
 		read -rp "Select interface [1-${#IFACES[@]}]: " CHOICE
 	done
 
-	SERVER_WG_NIC="${IFACES[$((CHOICE-1))]}"
-	loadInterfaceParams "${SERVER_WG_NIC}"
+	SERVER_WG_NIC="${IFACES[$((CHOICE - 1))]}"
+	loadInterfaceParams "${SERVER_WG_NIC}" || return 1
 }
 
 function removeInterface() {
-	selectInterface
+	local REMOVE_ONE=""
+
+	selectInterface || return
 
 	echo ""
 	echo -e "${RED}WARNING: This will remove interface ${SERVER_WG_NIC} and its clients only.${NC}"
@@ -191,13 +176,27 @@ function removeInterface() {
 	rm -f "/etc/wireguard/${SERVER_WG_NIC}.conf"
 	rm -f "/etc/wireguard/${SERVER_WG_NIC}.params"
 	rm -rf "/opt/wireguard/${SERVER_WG_NIC}-clients"
+	rm -rf "/opt/wireguard/${SERVER_WG_NIC}-qrcodes"
 
 	echo -e "${GREEN}Interface ${SERVER_WG_NIC} removed.${NC}"
 }
 
 function installQuestions() {
+	local DEFAULT_WG_NIC
+	local IFACE_INDEX=0
+
+	SERVER_PUB_IP=""
+	SERVER_PUB_NIC=""
+	SERVER_WG_NIC=""
+	SERVER_WG_IPV4=""
+	SERVER_WG_IPV6=""
+	SERVER_PORT=""
+	CLIENT_DNS_1=""
+	CLIENT_DNS_2=""
+	ALLOWED_IPS=""
+
 	echo "Welcome to the WireGuard installer!"
-	echo "The git repository is available at: https://github.com/angristan/wireguard-install"
+	echo "The git repository is available at: https://github.com/Yablowsky/wireguard-install"
 	echo ""
 	echo "I need to ask you a few questions before starting the setup."
 	echo "You can keep the default options and just press enter if you are ok with them."
@@ -217,8 +216,25 @@ function installQuestions() {
 		read -rp "Public interface: " -e -i "${SERVER_NIC}" SERVER_PUB_NIC
 	done
 
-	until [[ ${SERVER_WG_NIC} =~ ^[a-zA-Z0-9_]+$ && ${#SERVER_WG_NIC} -lt 16 ]]; do
-		read -rp "WireGuard interface name: " -e -i wg0 SERVER_WG_NIC
+	while interfaceExists "wg${IFACE_INDEX}"; do
+		((IFACE_INDEX += 1))
+	done
+	DEFAULT_WG_NIC="wg${IFACE_INDEX}"
+
+	while true; do
+		read -rp "WireGuard interface name: " -e -i "${DEFAULT_WG_NIC}" SERVER_WG_NIC
+
+		if ! [[ ${SERVER_WG_NIC} =~ ^[a-zA-Z0-9_]+$ && ${#SERVER_WG_NIC} -lt 16 ]]; then
+			echo -e "${ORANGE}The interface name must contain only letters, numbers and underscores and must be shorter than 16 characters.${NC}"
+			continue
+		fi
+
+		if interfaceExists "${SERVER_WG_NIC}"; then
+			echo -e "${ORANGE}Interface ${SERVER_WG_NIC} already exists. Please choose another name.${NC}"
+			continue
+		fi
+
+		break
 	done
 
 	until [[ ${SERVER_WG_IPV4} =~ ^([0-9]{1,3}\.){3} ]]; do
@@ -329,7 +345,7 @@ SERVER_PRIV_KEY=${SERVER_PRIV_KEY}
 SERVER_PUB_KEY=${SERVER_PUB_KEY}
 CLIENT_DNS_1=${CLIENT_DNS_1}
 CLIENT_DNS_2=${CLIENT_DNS_2}
-ALLOWED_IPS=${ALLOWED_IPS}" >/etc/wireguard/${SERVER_WG_NIC}.params
+ALLOWED_IPS=${ALLOWED_IPS}" >"/etc/wireguard/${SERVER_WG_NIC}.params"
 
 	# Add server interface
 	echo "[Interface]
@@ -359,9 +375,6 @@ net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/wg.conf
 		systemctl enable "wg-quick@${SERVER_WG_NIC}"
 	fi
 
-	newClient
-	echo -e "${GREEN}If you want to add more clients, you simply need to run this script another time!${NC}"
-
 	# Check if WireGuard is running
 	if [[ ${OS} == 'alpine' ]]; then
 		rc-service --quiet "wg-quick.${SERVER_WG_NIC}" status
@@ -388,16 +401,66 @@ net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/wg.conf
 		fi
 		echo -e "${ORANGE}If you don't have internet connectivity from your client, try to reboot the server.${NC}"
 	fi
+
+	addClients
+}
+
+function generateClientQrCode() {
+	local CLIENT_CONFIG="$1"
+	local CLIENT_NAME="$2"
+	local QR_DIR
+	local QR_FILE
+
+	if ! command -v qrencode &>/dev/null; then
+		echo -e "${ORANGE}qrencode is not installed, so the QR code cannot be generated.${NC}"
+		return 1
+	fi
+
+	if ! [[ -r ${CLIENT_CONFIG} ]]; then
+		echo -e "${RED}Client config file not found: ${CLIENT_CONFIG}${NC}"
+		return 1
+	fi
+
+	QR_DIR=$(getQrDirForInterface "${SERVER_WG_NIC}")
+	QR_FILE="${QR_DIR}/${CLIENT_NAME}.png"
+
+	if qrencode -t png -l L -o "${QR_FILE}" <"${CLIENT_CONFIG}"; then
+		chmod 600 "${QR_FILE}"
+		echo -e "${GREEN}QR code saved to ${QR_FILE}${NC}"
+	else
+		echo -e "${RED}Failed to save QR code to ${QR_FILE}.${NC}"
+	fi
+
+	echo -e "${GREEN}\nHere is your client config file as a QR code:\n${NC}"
+	qrencode -t ansiutf8 -l L <"${CLIENT_CONFIG}"
+	echo ""
 }
 
 function newClient() {
+	local ENDPOINT_IP="${SERVER_PUB_IP}"
+	local ENDPOINT
+	local CLIENT_NAME=""
+	local CLIENT_EXISTS=""
+	local DOT_IP
+	local DOT_EXISTS
+	local BASE_IP
+	local IPV4_EXISTS=""
+	local IPV6_EXISTS=""
+	local CLIENT_WG_IPV4
+	local CLIENT_WG_IPV6
+	local CLIENT_PRIV_KEY
+	local CLIENT_PUB_KEY
+	local CLIENT_PRE_SHARED_KEY
+	local CLIENT_DIR
+	local CLIENT_CONFIG
+
 	# If SERVER_PUB_IP is IPv6, add brackets if missing
-	if [[ ${SERVER_PUB_IP} =~ .*:.* ]]; then
-		if [[ ${SERVER_PUB_IP} != *"["* ]] || [[ ${SERVER_PUB_IP} != *"]"* ]]; then
-			SERVER_PUB_IP="[${SERVER_PUB_IP}]"
+	if [[ ${ENDPOINT_IP} =~ .*:.* ]]; then
+		if [[ ${ENDPOINT_IP} != *"["* ]] || [[ ${ENDPOINT_IP} != *"]"* ]]; then
+			ENDPOINT_IP="[${ENDPOINT_IP}]"
 		fi
 	fi
-	ENDPOINT="${SERVER_PUB_IP}:${SERVER_PORT}"
+	ENDPOINT="${ENDPOINT_IP}:${SERVER_PORT}"
 
 	echo ""
 	echo "Client configuration"
@@ -415,8 +478,9 @@ function newClient() {
 		fi
 	done
 
+	BASE_IP=$(echo "$SERVER_WG_IPV4" | awk -F '.' '{ print $1"."$2"."$3 }')
 	for DOT_IP in {2..254}; do
-		DOT_EXISTS=$(grep -c "${SERVER_WG_IPV4::-1}${DOT_IP}" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+		DOT_EXISTS=$(grep -F -c "${BASE_IP}.${DOT_IP}/32" "/etc/wireguard/${SERVER_WG_NIC}.conf")
 		if [[ ${DOT_EXISTS} == '0' ]]; then
 			break
 		fi
@@ -425,10 +489,9 @@ function newClient() {
 	if [[ ${DOT_EXISTS} == '1' ]]; then
 		echo ""
 		echo "The subnet configured supports only 253 clients."
-		exit 1
+		return 1
 	fi
 
-	BASE_IP=$(echo "$SERVER_WG_IPV4" | awk -F '.' '{ print $1"."$2"."$3 }')
 	until [[ ${IPV4_EXISTS} == '0' ]]; do
 		read -rp "Client WireGuard IPv4: ${BASE_IP}." -e -i "${DOT_IP}" DOT_IP
 		CLIENT_WG_IPV4="${BASE_IP}.${DOT_IP}"
@@ -460,6 +523,7 @@ function newClient() {
 	CLIENT_PRE_SHARED_KEY=$(wg genpsk)
 
 	CLIENT_DIR=$(getClientDirForInterface "${SERVER_WG_NIC}")
+	CLIENT_CONFIG="${CLIENT_DIR}/${CLIENT_NAME}.conf"
 
 	# Create client file and add the server as a peer
 	echo "[Interface]
@@ -476,7 +540,8 @@ DNS = ${CLIENT_DNS_1},${CLIENT_DNS_2}
 PublicKey = ${SERVER_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 Endpoint = ${ENDPOINT}
-AllowedIPs = ${ALLOWED_IPS}" >"${CLIENT_DIR}/${CLIENT_NAME}.conf"
+AllowedIPs = ${ALLOWED_IPS}" >"${CLIENT_CONFIG}"
+	chmod 600 "${CLIENT_CONFIG}"
 
 	# Add the client as a peer to the server
 	echo -e "\n### Client ${CLIENT_NAME}
@@ -486,63 +551,121 @@ PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 AllowedIPs = ${CLIENT_WG_IPV4}/32,${CLIENT_WG_IPV6}/128" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
 
 	if ip link show "${SERVER_WG_NIC}" >/dev/null 2>&1; then
-	wg syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${SERVER_WG_NIC}")
+		wg syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${SERVER_WG_NIC}")
 	fi
 
-	# Generate QR code if qrencode is installed
-	if command -v qrencode &>/dev/null; then
-		echo -e "${GREEN}\nHere is your client config file as a QR Code:\n${NC}"
-		qrencode -t ansiutf8 -l L <"${CLIENT_DIR}/${CLIENT_NAME}.conf"
-		echo ""
-	fi
-
-	echo -e "${GREEN}Your client config file is in ${CLIENT_DIR}/${CLIENT_NAME}.conf${NC}"
+	generateClientQrCode "${CLIENT_CONFIG}" "${CLIENT_NAME}" || true
+	echo -e "${GREEN}Your client config file is in ${CLIENT_CONFIG}${NC}"
 }
 
 function listClients() {
+	local NUMBER_OF_CLIENTS
+
 	NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf")
 	if [[ ${NUMBER_OF_CLIENTS} -eq 0 ]]; then
 		echo ""
 		echo "You have no existing clients!"
-		exit 1
+		return 1
 	fi
 
 	grep -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf" | cut -d ' ' -f 3 | nl -s ') '
 }
 
-function revokeClient() {
+function selectClient() {
+	local ACTION="$1"
+	local NUMBER_OF_CLIENTS
+	local CLIENT_NUMBER=""
+
+	SELECTED_CLIENT_NAME=""
 	NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf")
 	if [[ ${NUMBER_OF_CLIENTS} == '0' ]]; then
 		echo ""
 		echo "You have no existing clients!"
-		exit 1
+		return 1
 	fi
 
 	echo ""
-	echo "Select the existing client you want to revoke"
+	echo "Select the existing client you want to ${ACTION}"
 	grep -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf" | cut -d ' ' -f 3 | nl -s ') '
-	until [[ ${CLIENT_NUMBER} -ge 1 && ${CLIENT_NUMBER} -le ${NUMBER_OF_CLIENTS} ]]; do
-		if [[ ${CLIENT_NUMBER} == '1' ]]; then
+	until [[ ${CLIENT_NUMBER} =~ ^[0-9]+$ ]] && ((CLIENT_NUMBER >= 1 && CLIENT_NUMBER <= NUMBER_OF_CLIENTS)); do
+		if [[ ${NUMBER_OF_CLIENTS} == '1' ]]; then
 			read -rp "Select one client [1]: " CLIENT_NUMBER
 		else
 			read -rp "Select one client [1-${NUMBER_OF_CLIENTS}]: " CLIENT_NUMBER
 		fi
 	done
 
-	# match the selected number to a client name
-	CLIENT_NAME=$(grep -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf" | cut -d ' ' -f 3 | sed -n "${CLIENT_NUMBER}"p)
+	SELECTED_CLIENT_NAME=$(grep -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf" | cut -d ' ' -f 3 | sed -n "${CLIENT_NUMBER}"p)
+}
 
-	# remove [Peer] block matching $CLIENT_NAME
-	sed -i "/^### Client ${CLIENT_NAME}\$/,/^$/d" "/etc/wireguard/${SERVER_WG_NIC}.conf"
+function showClientQrCode() {
+	local CLIENT_DIR
+	local CLIENT_CONFIG
 
-	# remove generated client file
+	selectClient "display as a QR code" || return
 	CLIENT_DIR=$(getClientDirForInterface "${SERVER_WG_NIC}")
-	rm -f "${CLIENT_DIR}/${CLIENT_NAME}.conf"
+	CLIENT_CONFIG="${CLIENT_DIR}/${SELECTED_CLIENT_NAME}.conf"
+
+	if ! [[ -f ${CLIENT_CONFIG} ]]; then
+		echo -e "${RED}The server peer exists, but its client config is missing: ${CLIENT_CONFIG}${NC}"
+		echo "A QR code cannot be restored without the client's private key."
+		return
+	fi
+
+	generateClientQrCode "${CLIENT_CONFIG}" "${SELECTED_CLIENT_NAME}" || true
+}
+
+function revokeClient() {
+	local CLIENT_DIR
+
+	selectClient "revoke" || return
+
+	# remove [Peer] block matching $SELECTED_CLIENT_NAME
+	sed -i "/^### Client ${SELECTED_CLIENT_NAME}\$/,/^$/d" "/etc/wireguard/${SERVER_WG_NIC}.conf"
+
+	# remove generated client files
+	CLIENT_DIR=$(getClientDirForInterface "${SERVER_WG_NIC}")
+	rm -f "${CLIENT_DIR}/${SELECTED_CLIENT_NAME}.conf"
+	rm -f "/opt/wireguard/${SERVER_WG_NIC}-qrcodes/${SELECTED_CLIENT_NAME}.png"
 
 	# restart wireguard to apply changes
 	if ip link show "${SERVER_WG_NIC}" >/dev/null 2>&1; then
-	wg syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${SERVER_WG_NIC}")
+		wg syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${SERVER_WG_NIC}")
 	fi
+
+	echo -e "${GREEN}Client ${SELECTED_CLIENT_NAME} revoked.${NC}"
+}
+
+function addClients() {
+	local NEXT_ACTION=""
+
+	while true; do
+		newClient || return
+
+		echo ""
+		echo "What do you want to do next?"
+		echo "   1) Add another client to ${SERVER_WG_NIC}"
+		echo "   2) Return to the main menu"
+		echo "   3) Exit"
+
+		NEXT_ACTION=""
+		until [[ ${NEXT_ACTION} =~ ^[1-3]$ ]]; do
+			read -rp "Select an option [1-3, default 2]: " NEXT_ACTION
+			NEXT_ACTION=${NEXT_ACTION:-2}
+		done
+
+		case "${NEXT_ACTION}" in
+		1)
+			continue
+			;;
+		2)
+			return
+			;;
+		3)
+			exit 0
+			;;
+		esac
+	done
 }
 
 function uninstallWg() {
@@ -615,60 +738,74 @@ function uninstallWg() {
 }
 
 function manageMenu() {
-	echo "Welcome to WireGuard-install!"
-	echo ""
-	echo "What do you want to do?"
-	echo "   1) Create new interface"
-	echo "   2) List interfaces"
-	echo "   3) Add new client to interface"
-	echo "   4) List clients of interface"
-	echo "   5) Revoke client from interface"
-	echo "   6) Remove interface"
-	echo "   7) Uninstall WireGuard completely"
-	echo "   8) Exit"
-
 	local MENU_OPTION
-	until [[ ${MENU_OPTION} =~ ^[1-8]$ ]]; do
-		read -rp "Select an option [1-8]: " MENU_OPTION
-	done
 
-	case "${MENU_OPTION}" in
-	1)
-		installWireGuard
-		;;
-	2)
-		listInterfaces
-		;;
-	3)
-		selectInterface
-		newClient
-		;;
-	4)
-		selectInterface
-		listClients
-		;;
-	5)
-		selectInterface
-		revokeClient
-		;;
-	6)
-		removeInterface
-		;;
-	7)
-		uninstallWg
-		;;
-	8)
-		exit 0
-		;;
-	esac
+	while true; do
+		echo ""
+		echo "Welcome to WireGuard-install!"
+		echo ""
+		echo "What do you want to do?"
+		echo "   1) Create new interface"
+		echo "   2) List interfaces"
+		echo "   3) Add new client to interface"
+		echo "   4) List clients of interface"
+		echo "   5) Show QR code for existing client"
+		echo "   6) Revoke client from interface"
+		echo "   7) Remove interface"
+		echo "   8) Uninstall WireGuard completely"
+		echo "   9) Exit"
+
+		MENU_OPTION=""
+		until [[ ${MENU_OPTION} =~ ^[1-9]$ ]]; do
+			read -rp "Select an option [1-9]: " MENU_OPTION
+		done
+
+		case "${MENU_OPTION}" in
+		1)
+			installWireGuard
+			;;
+		2)
+			listInterfaces
+			;;
+		3)
+			if selectInterface; then
+				addClients
+			fi
+			;;
+		4)
+			if selectInterface; then
+				listClients
+			fi
+			;;
+		5)
+			if selectInterface; then
+				showClientQrCode
+			fi
+			;;
+		6)
+			if selectInterface; then
+				revokeClient
+			fi
+			;;
+		7)
+			removeInterface
+			;;
+		8)
+			uninstallWg
+			;;
+		9)
+			exit 0
+			;;
+		esac
+	done
 }
 
 # Check for root, virt, OS...
 initialCheck
 
 # Check if WireGuard is already installed and load params
-if compgen -G "/etc/wireguard/*.conf" > /dev/null; then
-	manageMenu
-else
+if ! compgen -G "/etc/wireguard/*.conf" >/dev/null; then
 	installWireGuard
 fi
+
+manageMenu
