@@ -182,6 +182,9 @@ function removeInterface() {
 }
 
 function installQuestions() {
+	local DEFAULT_WG_NIC
+	local IFACE_INDEX=0
+
 	SERVER_PUB_IP=""
 	SERVER_PUB_NIC=""
 	SERVER_WG_NIC=""
@@ -213,8 +216,13 @@ function installQuestions() {
 		read -rp "Public interface: " -e -i "${SERVER_NIC}" SERVER_PUB_NIC
 	done
 
+	while interfaceExists "wg${IFACE_INDEX}"; do
+		((IFACE_INDEX += 1))
+	done
+	DEFAULT_WG_NIC="wg${IFACE_INDEX}"
+
 	while true; do
-		read -rp "WireGuard interface name: " -e -i wg0 SERVER_WG_NIC
+		read -rp "WireGuard interface name: " -e -i "${DEFAULT_WG_NIC}" SERVER_WG_NIC
 
 		if ! [[ ${SERVER_WG_NIC} =~ ^[a-zA-Z0-9_]+$ && ${#SERVER_WG_NIC} -lt 16 ]]; then
 			echo -e "${ORANGE}The interface name must contain only letters, numbers and underscores and must be shorter than 16 characters.${NC}"
